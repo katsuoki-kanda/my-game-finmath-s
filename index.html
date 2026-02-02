@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Math Game - Audio Fixed</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body {
+            margin: 0; padding: 0; overflow: hidden;
+            background: #000; font-family: 'Arial Black', sans-serif;
+            display: flex; justify-content: center; align-items: center; height: 100vh;
+        }
+        #container { position: relative; width: 100%; height: 100%; max-width: 1280px; max-height: 720px; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+        
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; color: #0f0; text-shadow: 4px 4px #000;
+            padding: 30px; box-sizing: border-box;
+            z-index: 10;
+        }
+
+        /* スタート画面のオーバーレイ（音声解除用） */
+        #start-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 200; pointer-events: auto; cursor: pointer; color: white;
+        }
+        .start-btn { font-size: 60px; padding: 20px 60px; background: #f00; color: #fff; border-radius: 50px; font-weight: bold; border: 5px solid #fff; }
+        #start-overlay p { font-size: 24px; margin-top: 20px; }
+
+        .hud { font-size: 48px; font-weight: bold; margin-bottom: 5px; }
+        #time-text { color: #fff; }
+        
+        #status-text {
+            position: absolute;
+            top: 130px; 
+            left: 0;
+            font-size: 40px; 
+            color: #0f0; 
+            text-align: center; 
+            width: 100%;
+        }
+
+        #question-area {
+            position: absolute; 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%);
+            text-align: center; 
+            width: 100%;
+        }
+        .main-q { 
+            font-size: 300px; color: #f00; font-weight: bold; 
+            -webkit-text-stroke: 8px #00f;
+            letter-spacing: -10px;
+            line-height: 1; 
+        }
+
+        .correct-circle {
+            position: absolute; 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%);
+            width: 400px; 
+            height: 400px; 
+            border: 40px solid #f00; 
+            border-radius: 50%; 
+            display: none;
+            box-shadow: 0 0 20px #000; 
+        }
+
+        .footer-hint {
+            position: absolute; bottom: 20px; left: 20px; color: #aaa; font-size: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <div id="start-overlay" onclick="handleStartInteraction()">
+        <div class="start-btn">CLICK TO START</div>
+        <p>画面をタップして音声を有効にしてください</p>
+    </div>
+
+    <video id="input_video" style="display:none;"></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="ui-layer">
+        <div class="hud" id="score-text">Score: 0</div>
+        <div class="hud" id="time-text">Time: 60</div>
+        
+        <div id="status-text">カメラを読み込み中...</div>
+        
+        <div id="question-area">
+            <div id="main-q" class="main-q"></div>
+            <div id="correct-circle" class="correct-circle"></div>
+        </div>
+
+        <div class="footer-hint">
+            [1]:音声 [2]:表示 [F]:全画面 [Enter]:リスタート
+        </div>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreText = document.getElementById('score-text');
+    const timeText = document.getElementById('time-text');
+    const statusText = document.getElementById('status-text');
+    const mainQ = document.getElementById('main-q');
+    const correctCircle = document.getElementById('correct-circle');
+    const startOverlay = document.getElementById('start-overlay');
+
+    let score = 0;
+    let timeLeft = 60;
+    let gameStarted = false;
+    let voiceMode = 0;
+    let currentAns = 0;
+    let lastAns = 0; 
+    let seiCount = 0;
+    let startTime = 0;
+    let audioUnlocked = false;
+    
+    // 安定化のための変数
+    let lastHandCount = 0;
+    let handStableTime = 0;
+    const DETECTION_DELAY = 0;
+
+    // 音声コンテキストの共通化
+    let audioCtx = null;
+    const synth = window.speechSynthesis;
+
+    // Chromebook/iOS用：音声合成の準備
+    function primeSpeech() {
+        synth.cancel();
+        const ut = new SpeechSynthesisUtterance("");
+        synth.speak(ut);
+    }
+
+    function speak(text) {
+        if (!text || !audioUnlocked) return;
+        synth.cancel(); // 前の音声を止めて反応を速くする
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        uttr.rate = 1.2;
+        synth.speak(uttr);
+    }
+
+    function beep() {
+        if (!audioCtx) return;
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(700, audioCtx.currentTime);
+        
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc.start();
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.1);
+        osc.stop(audioCtx.currentTime + 0.15);
+    }
+
+    // 初回タップ時の処理
+    function handleStartInteraction() {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+        audioUnlocked = true;
+        primeSpeech();
+        startOverlay.style.display = 'none';
+        statusText.textContent = "片手を高く挙げるとスタート！";
+    }
+
+    function initGame() {
+        if (!audioUnlocked) return;
+        score = 0;
+        timeLeft = 60;
+        lastAns = 0; 
+        scoreText.textContent = `Score: ${score}`;
+        timeText.textContent = `Time: ${timeLeft}`;
+        gameStarted = true;
+        startTime = Date.now();
+        statusText.textContent = ""; 
+        speak("スタート");
+        generateQuestion();
+    }
+
+    function generateQuestion() {
+        let n1, n2, newAns;
+        do {
+            n1 = Math.floor(Math.random() * 5) + 1;
+            n2 = Math.floor(Math.random() * 5) + 1;
+            newAns = n1 + n2;
+        } while (newAns === lastAns);
+
+        currentAns = newAns;
+        lastAns = currentAns; 
+        
+        if (voiceMode === 1) {
+            mainQ.textContent = "?+?";
+            speak(`${n1}たす${n2}`);
+        } else {
+            mainQ.textContent = `${n1}+${n2}`;
+        }
+    }
+
+    function onResults(results) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        let rightHandFingers = 0;
+        let leftHandFingers = 0;
+        let handsDetectedCount = 0;
+        let detectedLabels = new Set();
+
+        if (results.multiHandLandmarks && results.multiHandedness) {
+            for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                const landmarks = results.multiHandLandmarks[i];
+                const label = results.multiHandedness[i].label;
+
+                if (landmarks[0].y > 0.85) continue;
+
+                if (detectedLabels.has(label)) continue;
+                detectedLabels.add(label);
+                handsDetectedCount++;
+
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 5});
+                drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 2});
+
+                let count = 0;
+                if (label === 'Right' ? landmarks[4].x < landmarks[3].x : landmarks[4].x > landmarks[3].x) count++;
+                [8, 12, 16, 20].forEach(idx => {
+                    if (landmarks[idx].y < landmarks[idx - 2].y) count++;
+                });
+
+                if (label === 'Right') rightHandFingers = count;
+                else leftHandFingers = count;
+
+                // ゲーム開始判定
+                if (!gameStarted && audioUnlocked && landmarks[0].y < 0.3) {
+                    initGame();
+                }
+            }
+        }
+
+        const now = Date.now();
+        if (handsDetectedCount !== lastHandCount) {
+            handStableTime = now;
+            lastHandCount = handsDetectedCount;
+        }
+
+        const isStable = (now - handStableTime) > DETECTION_DELAY;
+        const totalFingers = rightHandFingers + leftHandFingers;
+
+        if (gameStarted) {
+            const elapsed = Math.floor((now - startTime) / 1000);
+            timeLeft = Math.max(0, 60 - elapsed);
+            timeText.textContent = `Time: ${timeLeft}`;
+
+            if (timeLeft <= 0) {
+                gameStarted = false;
+                mainQ.textContent = "FINISH";
+                speak(`${score}点です。終了。`);
+                statusText.textContent = "Enterキーでリスタート";
+            }
+
+            const isCorrectSum = (totalFingers === currentAns);
+            const handCondition = (currentAns > 5) ? (handsDetectedCount === 2) : (handsDetectedCount >= 1);
+
+            if (isCorrectSum && handCondition && isStable && seiCount === 0 && timeLeft > 0) {
+                score++;
+                scoreText.textContent = `Score: ${score}`;
+                beep();
+                seiCount = 1;
+                correctCircle.style.display = "block";
+                mainQ.textContent = currentAns;
+                
+                setTimeout(() => {
+                    correctCircle.style.display = "none";
+                    seiCount = 0;
+                    if (gameStarted) generateQuestion();
+                }, 700);
+            }
+        }
+        canvasCtx.restore();
+    }
+
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({ 
+        maxNumHands: 2, 
+        modelComplexity: 1, 
+        minDetectionConfidence: 0.7, 
+        minTrackingConfidence: 0.7 
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 1280, height: 720
+    });
+    camera.start();
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === '1') { speak("音声モード"); voiceMode = 1; if(gameStarted) generateQuestion(); }
+        if (e.key === '2') { speak("表示モード"); voiceMode = 0; if(gameStarted) generateQuestion(); }
+        if (e.key === 'f') {
+            if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+            else document.exitFullscreen();
+        }
+        if (e.key === 'Enter') {
+            if (audioUnlocked) initGame();
+        }
+    });
+
+    function resize() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+</script>
+</body>
+</html>
